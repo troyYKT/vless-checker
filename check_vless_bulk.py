@@ -2,10 +2,20 @@
 """
 Bulk VLESS checker.
 
-Checks VLESS links from a local .txt file or URL by launching xray-core with each
-link as outbound, then testing access through a temporary local SOCKS proxy.
+Checks VLESS links from CIDR/SNI subscription files by launching xray-core as a
+client for each link, opening a temporary local SOCKS proxy, then testing access
+through that proxy.
 
-Config latency (cfg_ms) is measured through https://www.gstatic.com/generate_204.
+Features:
+  - Interactive source menu: CIDR / SNI / custom input
+  - Interactive mode menu: normal / light
+  - GitHub download with local fallback/cache
+  - macOS-friendly fallback folder: ~/vless_checker
+  - Linux root fallback folder: /root/vless_checker
+  - Clean v2rayNG/Happ-compatible output links
+  - Config latency via https://www.gstatic.com/generate_204
+  - Fastest working configs saved first
+  - Colored terminal output: OK green, FAIL red
 
 Requirements:
   - python3
@@ -13,11 +23,11 @@ Requirements:
   - curl in PATH
 
 Examples:
-  python3 check_vless_bulk.py          # menu: downloads CIDR/SNI, falls back to /root/vless_checker files
-  python3 check_vless_bulk.py --input links.txt
-  python3 check_vless_bulk.py --input 'https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt' --workers 4 --limit 0
-  python3 check_vless_bulk.py --input links.txt --workers 12 --service-workers 6 --timeout 8 --limit 0
-  python3 check_vless_bulk.py --mode light --limit 0
+  python3 check_vless_bulk.py
+  python3 check_vless_bulk.py --mode light
+  python3 check_vless_bulk.py --mode normal --limit 30
+  python3 check_vless_bulk.py --input links.txt --mode light
+  python3 check_vless_bulk.py --local-dir ~/vless_checker --mode normal
 """
 
 from __future__ import annotations
@@ -28,6 +38,7 @@ import csv
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -44,21 +55,30 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 PRINT_LOCK = threading.Lock()
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_LOCAL_SOURCE_DIR = Path("/root/vless_checker")
 
-# ANSI colors for terminal output. Disabled automatically when stdout is not a TTY
-# or when NO_COLOR is set, so redirected logs stay clean.
+
+def default_local_source_dir() -> Path:
+    env_value = os.environ.get("VLESS_CHECKER_LOCAL_DIR")
+    if env_value:
+        return Path(env_value).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "vless_checker"
+    try:
+        if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            return Path("/root/vless_checker")
+    except Exception:
+        pass
+    return Path.home() / "vless_checker"
+
+
+DEFAULT_LOCAL_SOURCE_DIR = default_local_source_dir()
+
+# ANSI colors. Disabled automatically when stdout is not a TTY or NO_COLOR is set.
 USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 COLOR_GREEN = "\033[92m"
 COLOR_RED = "\033[91m"
+COLOR_YELLOW = "\033[93m"
 COLOR_RESET = "\033[0m"
-
-
-def color_text(text: str, color: str) -> str:
-    if not USE_COLOR:
-        return text
-    return f"{color}{text}{COLOR_RESET}"
-
 
 CONFIG_LATENCY_URL = "https://www.gstatic.com/generate_204"
 
@@ -67,8 +87,6 @@ DEFAULT_TESTS = {
     "google": "https://www.google.com/generate_204",
     "youtube": "https://www.youtube.com/generate_204",
     "instagram": "https://www.instagram.com/favicon.ico",
-    # Lightweight checks only. Extra Telegram/WhatsApp domains were removed
-    # because they made the filter too strict for real-world working configs.
     "telegram": "https://telegram.org/favicon.ico",
     "whatsapp": "https://www.whatsapp.com/favicon.ico",
 }
@@ -95,7 +113,7 @@ PRESET_SOURCES = {
 
 @dataclass
 class TestResult:
-    ok: bool
+    ok: bool = False
     http_code: str = "000"
     time_total: str = ""
     error: str = ""
@@ -107,50 +125,30 @@ class LinkResult:
     index: int
     name: str
     link: str
-    ok: bool
-    ip_ok: bool
-    google_ok: bool
-    youtube_ok: bool
-    instagram_ok: bool
-    telegram_ok: bool
-    whatsapp_ok: bool
-    telegram_org_ok: bool
-    telegram_web_ok: bool
-    telegram_tme_ok: bool
-    whatsapp_www_ok: bool
-    whatsapp_web_ok: bool
-    whatsapp_static_ok: bool
-    ip_http: str
-    google_http: str
-    youtube_http: str
-    instagram_http: str
-    telegram_http: str
-    whatsapp_http: str
-    telegram_org_http: str
-    telegram_web_http: str
-    telegram_tme_http: str
-    whatsapp_www_http: str
-    whatsapp_web_http: str
-    whatsapp_static_http: str
-    config_time: str
-    latency_score: float
-    ip_body: str
-    error: str
-    elapsed: float
+    ok: bool = False
+    ip_ok: bool = False
+    google_ok: bool = False
+    youtube_ok: bool = False
+    instagram_ok: bool = False
+    telegram_ok: bool = False
+    whatsapp_ok: bool = False
+    ip_http: str = "000"
+    google_http: str = "000"
+    youtube_http: str = "000"
+    instagram_http: str = "000"
+    telegram_http: str = "000"
+    whatsapp_http: str = "000"
+    config_time: str = ""
+    latency_score: float = 9999.0
+    ip_body: str = ""
+    error: str = ""
+    elapsed: float = 0.0
 
 
-def make_empty_result(index: int, name: str, link: str, error: str, elapsed: float) -> LinkResult:
-    """Build a failed LinkResult with all checks empty/false."""
-    return LinkResult(
-        index=index, name=name, link=link, ok=False,
-        ip_ok=False, google_ok=False, youtube_ok=False, instagram_ok=False, telegram_ok=False, whatsapp_ok=False,
-        telegram_org_ok=False, telegram_web_ok=False, telegram_tme_ok=False,
-        whatsapp_www_ok=False, whatsapp_web_ok=False, whatsapp_static_ok=False,
-        ip_http="000", google_http="000", youtube_http="000", instagram_http="000", telegram_http="000", whatsapp_http="000",
-        telegram_org_http="000", telegram_web_http="000", telegram_tme_http="000",
-        whatsapp_www_http="000", whatsapp_web_http="000", whatsapp_static_http="000",
-        config_time="", latency_score=9999.0, ip_body="", error=error, elapsed=elapsed,
-    )
+def color_text(text: str, color: str) -> str:
+    if not USE_COLOR:
+        return text
+    return f"{color}{text}{COLOR_RESET}"
 
 
 def log(msg: str) -> None:
@@ -159,7 +157,6 @@ def log(msg: str) -> None:
 
 
 def decode_output(data) -> str:
-    """Decode subprocess output safely, even if a server sends non-UTF-8 bytes."""
     if data is None:
         return ""
     if isinstance(data, bytes):
@@ -168,9 +165,8 @@ def decode_output(data) -> str:
 
 
 def time_to_float(value: str, default: float = 9999.0) -> float:
-    """Convert curl %{time_total} seconds string to float for sorting."""
     try:
-        if value is None or value == "":
+        if not value:
             return default
         return float(str(value).replace(",", "."))
     except Exception:
@@ -178,28 +174,23 @@ def time_to_float(value: str, default: float = 9999.0) -> float:
 
 
 def time_to_ms(value: str) -> str:
-    """Return curl seconds string as milliseconds for readable console/CSV output."""
     try:
         return str(int(round(float(str(value).replace(",", ".")) * 1000)))
     except Exception:
         return ""
 
-def http_group_code(*results: TestResult) -> str:
-    """Return grouped HTTP codes like 200/200/302 for multi-domain checks."""
-    return "/".join((r.http_code or "000") for r in results)
 
-
-def bool_group(*results: TestResult) -> bool:
-    """Group check succeeds only when every required domain is reachable."""
-    return all(r.ok for r in results)
+def safe_filename_part(value: Optional[str]) -> str:
+    value = value or "custom"
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    value = value.strip("._-")
+    return value or "custom"
 
 
 def github_blob_to_raw(url: str) -> str:
-    """Convert github.com/.../blob/branch/path to raw.githubusercontent.com URL."""
     p = urllib.parse.urlsplit(url)
     if p.netloc.lower() != "github.com" or "/blob/" not in p.path:
         return url
-    # /owner/repo/blob/branch/path/to/file
     parts = p.path.strip("/").split("/")
     if len(parts) >= 5 and parts[2] == "blob":
         owner, repo, _, branch = parts[:4]
@@ -209,14 +200,31 @@ def github_blob_to_raw(url: str) -> str:
 
 
 def url_basename_for_cache(source: str) -> str:
-    """Return a safe filename for caching/fallback by URL basename."""
     try:
         url = github_blob_to_raw(source)
         name = Path(urllib.parse.urlsplit(url).path).name
     except Exception:
         name = ""
-    name = safe_filename_part(name) if name else "vless_links.txt"
-    return name or "vless_links.txt"
+    return safe_filename_part(name) if name else "vless_links.txt"
+
+
+def fallback_candidates(local_source_dir: Path, fallback_name: str) -> List[Path]:
+    paths = [
+        local_source_dir.expanduser() / fallback_name,
+        SCRIPT_DIR / fallback_name,
+        Path.cwd() / fallback_name,
+    ]
+    unique: List[Path] = []
+    seen = set()
+    for p in paths:
+        try:
+            key = str(p.resolve())
+        except Exception:
+            key = str(p)
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return unique
 
 
 def read_input(
@@ -225,16 +233,12 @@ def read_input(
     local_fallback: Optional[str] = None,
     local_source_dir: Path = DEFAULT_LOCAL_SOURCE_DIR,
 ) -> str:
-    """Read links from URL or file.
+    source = str(Path(source).expanduser()) if not re.match(r"^https?://", source, re.I) else source
 
-    For URLs, first tries to download fresh content. If download fails, reads a
-    fallback file from local_source_dir. On successful download, the content is
-    saved to that fallback file for future offline/blocked runs.
-    """
     if re.match(r"^https?://", source, re.I):
         url = github_blob_to_raw(source)
         fallback_name = local_fallback or url_basename_for_cache(url)
-        fallback_path = local_source_dir / fallback_name
+        primary_fallback = local_source_dir.expanduser() / fallback_name
 
         try:
             log(f"Downloading source: {url}")
@@ -243,37 +247,37 @@ def read_input(
                 data = resp.read()
             text = data.decode("utf-8", errors="replace")
 
-            # Refresh local copy. If the fallback folder is not writable, continue anyway.
             try:
-                fallback_path.parent.mkdir(parents=True, exist_ok=True)
-                fallback_path.write_text(text, encoding="utf-8")
-                log(f"Saved/updated local copy: {fallback_path}")
+                primary_fallback.parent.mkdir(parents=True, exist_ok=True)
+                primary_fallback.write_text(text, encoding="utf-8")
+                log(f"Saved/updated local copy: {primary_fallback}")
             except Exception as e:
-                log(f"Warning: could not save local copy {fallback_path}: {e}")
+                log(f"Warning: could not save local copy {primary_fallback}: {e}")
             return text
 
         except Exception as e:
             log(f"Download failed: {e}")
-            if fallback_path.exists():
-                log(f"Using local fallback: {fallback_path}")
-                return fallback_path.read_text(encoding="utf-8", errors="replace")
+            candidates = fallback_candidates(local_source_dir, fallback_name)
+            for path in candidates:
+                if path.exists():
+                    log(f"Using local fallback: {path}")
+                    return path.read_text(encoding="utf-8", errors="replace")
+            tried = "\n  ".join(str(p) for p in candidates)
             raise RuntimeError(
-                f"Could not download {url} and local fallback was not found: {fallback_path}"
+                f"Could not download {url} and no local fallback was found. Tried:\n  {tried}"
             ) from e
 
-    return Path(source).read_text(encoding="utf-8", errors="replace")
+    return Path(source).expanduser().read_text(encoding="utf-8", errors="replace")
 
 
 def try_b64_decode(text: str) -> Optional[str]:
     compact = re.sub(r"\s+", "", text.strip())
     if not compact or len(compact) < 16:
         return None
-    # Do not try to decode normal text containing many URL punctuation chars.
     if "vless://" in text.lower():
         return None
     if not re.fullmatch(r"[A-Za-z0-9+/=_-]+", compact):
         return None
-    # support base64url and missing padding
     compact = compact.replace("-", "+").replace("_", "/")
     compact += "=" * (-len(compact) % 4)
     try:
@@ -290,28 +294,23 @@ def extract_vless_links(text: str) -> List[str]:
     decoded = try_b64_decode(text)
     if decoded:
         text = decoded
-
     links: List[str] = []
     seen = set()
-
     for raw_line in text.splitlines():
         line = raw_line.strip().strip('"\'')
         if not line or line.startswith("#"):
             continue
-        # Most subscription files keep one link per line.
         if line.lower().startswith("vless://"):
             link = line
             if link not in seen:
                 seen.add(link)
                 links.append(link)
             continue
-        # Fallback: pull links from mixed text/HTML. Stop on whitespace or quotes.
         for m in re.finditer(r"vless://[^\s<'\"]+", line, flags=re.I):
             link = m.group(0).strip()
             if link not in seen:
                 seen.add(link)
                 links.append(link)
-
     return links
 
 
@@ -323,7 +322,7 @@ def free_port() -> int:
     return port
 
 
-def wait_port(host: str, port: int, proc: subprocess.Popen, timeout: float = 4.0) -> bool:
+def wait_port(host: str, port: int, proc: subprocess.Popen, timeout: float = 5.0) -> bool:
     end = time.time() + timeout
     while time.time() < end:
         if proc.poll() is not None:
@@ -361,7 +360,7 @@ def parse_vless(url: str) -> Tuple[dict, str]:
     uuid = urllib.parse.unquote(parsed.username or "")
     host = parsed.hostname
     port = parsed.port
-    name = urllib.parse.unquote(parsed.fragment or host or f"link")
+    name = urllib.parse.unquote(parsed.fragment or host or "link")
     q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
     if not uuid or not host or not port:
@@ -406,13 +405,12 @@ def parse_vless(url: str) -> Tuple[dict, str]:
         stream["realitySettings"] = reality
 
     elif security not in {"none", ""}:
-        # Leave unsupported security as-is so xray can return a clear error.
+        # Keep unsupported security as-is; xray will report details.
         pass
 
-    # Transport settings
     if network == "tcp":
-        header_type = qget(q, "headerType") or qget(q, "headerType", "none")
-        if header_type and header_type != "none":
+        header_type = qget(q, "headerType", "none") or "none"
+        if header_type != "none":
             tcp = {"header": {"type": header_type}}
             host_header = qget(q, "host")
             path = qget(q, "path")
@@ -451,7 +449,6 @@ def parse_vless(url: str) -> Tuple[dict, str]:
         stream["httpupgradeSettings"] = hu
 
     elif network in {"xhttp", "splithttp"}:
-        # xray-core versions differ: new versions use xhttpSettings, older use splithttpSettings.
         key = "xhttpSettings" if network == "xhttp" else "splithttpSettings"
         xh = {"path": qget(q, "path", "/") or "/"}
         h = qget(q, "host")
@@ -507,6 +504,15 @@ def build_xray_config(vless_url: str, socks_port: int, socks_user: str, socks_pa
     return config, name
 
 
+def http_reachable(code: str) -> bool:
+    try:
+        c = int(code)
+        # 4xx still proves the remote host answered through the proxy.
+        return 200 <= c < 500
+    except Exception:
+        return False
+
+
 def curl_test(
     url: str,
     socks_port: int,
@@ -516,93 +522,57 @@ def curl_test(
     *,
     head: bool = False,
     capture_body: bool = False,
+    curl_bin: str = "curl",
 ) -> TestResult:
     proxy = f"socks5h://{urllib.parse.quote(socks_user)}:{urllib.parse.quote(socks_pass)}@127.0.0.1:{socks_port}"
-    # Separator makes parsing reliable even if a body is printed by a redirect/error page.
-    fmt = "\\n__CURL_META__%{http_code} %{time_total}"
+    marker = "\n__VLESS_CHECKER_HTTP_CODE__%{http_code}\n__VLESS_CHECKER_TIME_TOTAL__%{time_total}\n"
+
     cmd = [
-        "curl",
+        curl_bin,
+        "-L",
         "--silent",
         "--show-error",
-        "--location",
-        "--max-redirs",
-        "3",
-        "--connect-timeout",
-        str(timeout),
-        "--max-time",
-        str(timeout),
-        "--proxy",
-        proxy,
-        "-A",
-        USER_AGENT,
+        "--connect-timeout", str(timeout),
+        "--max-time", str(timeout),
+        "--user-agent", USER_AGENT,
+        "-x", proxy,
+        "-w", marker,
     ]
     if head:
-        # HEAD is much faster for access checks: we only need to know
-        # whether the host is reachable and returns any HTTP status.
         cmd.append("--head")
-    cmd += [
-        "-o",
-        "-" if capture_body else os.devnull,
-        "-w",
-        fmt,
-        url,
-    ]
+    if not capture_body:
+        cmd += ["-o", os.devnull]
+    cmd.append(url)
+
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False, timeout=timeout + 3)
-    except subprocess.TimeoutExpired:
-        return TestResult(ok=False, error="curl timeout")
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 3)
+    except subprocess.TimeoutExpired as e:
+        return TestResult(False, "000", "", f"curl timeout after {timeout}s", decode_output(e.stdout)[:200])
 
-    stdout = decode_output(p.stdout)
-    stderr = decode_output(p.stderr).strip()
-    http_code = "000"
-    time_total = ""
+    stdout = decode_output(result.stdout)
+    stderr = decode_output(result.stderr).strip()
+
+    code = "000"
+    total = ""
     body = stdout
-    marker = "\n__CURL_META__"
-    if marker in stdout:
-        body, meta = stdout.rsplit(marker, 1)
-        parts = meta.strip().split()
-        if parts:
-            http_code = parts[0]
-        if len(parts) > 1:
-            time_total = parts[1]
+    m = re.search(
+        r"\n__VLESS_CHECKER_HTTP_CODE__(\d{3})\n__VLESS_CHECKER_TIME_TOTAL__([0-9.,]+)\s*$",
+        stdout,
+        flags=re.S,
+    )
+    if m:
+        code = m.group(1)
+        total = m.group(2)
+        body = stdout[: m.start()]
 
-    # For access checking, any real HTTP response means TLS/connectivity reached the service.
-    # 403/429 can happen on Instagram/Google services but still mean it is reachable.
-    ok = p.returncode == 0 and http_code != "000"
-    preview = re.sub(r"\s+", " ", body.strip())[:180]
-    return TestResult(ok=ok, http_code=http_code, time_total=time_total, error=stderr, body_preview=preview)
-
-
-
-CHECK_MODES = {
-    "normal": {
-        "title": "normal",
-        "description": "strict: IP + Google + YouTube + Instagram + Telegram + WhatsApp",
-        "required": ("ip_ok", "google_ok", "youtube_ok", "instagram_ok", "telegram_ok", "whatsapp_ok"),
-    },
-    "light": {
-        "title": "light",
-        "description": "soft: IP + Google + YouTube; Instagram/Telegram/WhatsApp are diagnostic only",
-        "required": ("ip_ok", "google_ok", "youtube_ok"),
-    },
-}
-
-
-def result_ok_for_mode(
-    mode: str,
-    *,
-    ip_ok: bool,
-    google_ok: bool,
-    youtube_ok: bool,
-    instagram_ok: bool,
-    telegram_ok: bool,
-    whatsapp_ok: bool,
-) -> bool:
-    """Return whether a config should be saved for the selected mode."""
-    if mode == "light":
-        return ip_ok and google_ok and youtube_ok
-    # normal/strict mode
-    return ip_ok and google_ok and youtube_ok and instagram_ok and telegram_ok and whatsapp_ok
+    ok = result.returncode == 0 and http_reachable(code)
+    return TestResult(
+        ok=ok,
+        http_code=code,
+        time_total=total,
+        error="" if ok else (stderr or f"curl return code {result.returncode}"),
+        body_preview=body.strip()[:300] if capture_body else "",
+    )
 
 
 def check_one(
@@ -616,64 +586,51 @@ def check_one(
     use_head: bool,
     mode: str,
 ) -> LinkResult:
-    del curl_bin  # curl is called by name after we verified PATH; kept for readability.
     started = time.time()
-    socks_port = free_port()
-    socks_user = f"u{os.getpid()}_{index}"
-    socks_pass = base64.urlsafe_b64encode(os.urandom(9)).decode().rstrip("=")
-    name = f"link-{index}"
     proc: Optional[subprocess.Popen] = None
+    name = "link"
 
     try:
+        socks_port = free_port()
+        socks_user = "u" + secrets.token_hex(4)
+        socks_pass = "p" + secrets.token_hex(8)
         config, name = build_xray_config(link, socks_port, socks_user, socks_pass)
+
         with tempfile.TemporaryDirectory(prefix="vless-check-") as td:
-            config_path = os.path.join(td, "config.json")
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False)
+            config_path = Path(td) / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
             proc = subprocess.Popen(
-                [xray_bin, "run", "-config", config_path],
+                [xray_bin, "run", "-config", str(config_path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
 
             if not wait_port("127.0.0.1", socks_port, proc, timeout=5.0):
-                err = ""
+                err_text = ""
                 if proc.poll() is not None:
-                    _, err = proc.communicate(timeout=2)
-                err_text = decode_output(err).strip()[:300]
-                return make_empty_result(
-                    index=index, name=name, link=link,
-                    error=f"xray did not start/listen: {err_text}",
-                    elapsed=time.time() - started,
-                )
+                    try:
+                        _, err = proc.communicate(timeout=2)
+                        err_text = decode_output(err).strip()[:300]
+                    except Exception as e:
+                        err_text = str(e)[:300]
+                return LinkResult(index=index, name=name, link=link, error=f"xray did not start/listen: {err_text}", elapsed=time.time() - started)
 
-            # cfg_ms is a lightweight practical latency test through the VLESS config.
-            # It is intentionally separate from IP check, so sorting is not affected by
-            # api.ipify.org response time.
-            cfg = curl_test(CONFIG_LATENCY_URL, socks_port, socks_user, socks_pass, timeout, capture_body=False)
-            ip = curl_test(DEFAULT_TESTS["ip"], socks_port, socks_user, socks_pass, timeout, capture_body=True)
-            google = TestResult(False)
-            yt = TestResult(False)
-            ig = TestResult(False)
-            tg_org = TestResult(False)
-            tg_web = TestResult(False)
-            tg_tme = TestResult(False)
-            wa_www = TestResult(False)
-            wa_web = TestResult(False)
-            wa_static = TestResult(False)
+            cfg = curl_test(CONFIG_LATENCY_URL, socks_port, socks_user, socks_pass, timeout, head=True, curl_bin=curl_bin)
+            ip = curl_test(DEFAULT_TESTS["ip"], socks_port, socks_user, socks_pass, timeout, capture_body=True, curl_bin=curl_bin)
+
+            google = TestResult()
+            yt = TestResult()
+            ig = TestResult()
+            tg = TestResult()
+            wa = TestResult()
+
             if ip.ok or do_all_tests:
-                service_names = [
-                    "google",
-                    "youtube",
-                    "instagram",
-                    "telegram",
-                    "whatsapp",
-                ]
+                service_names = ["google", "youtube", "instagram", "telegram", "whatsapp"]
                 service_results: Dict[str, TestResult] = {}
                 max_service_workers = max(1, min(service_workers, len(service_names)))
                 with ThreadPoolExecutor(max_workers=max_service_workers) as tex:
-                    tfutures = {
+                    futures = {
                         tex.submit(
                             curl_test,
                             DEFAULT_TESTS[name],
@@ -683,43 +640,26 @@ def check_one(
                             timeout,
                             head=use_head,
                             capture_body=False,
+                            curl_bin=curl_bin,
                         ): name
                         for name in service_names
                     }
-                    for tfut in as_completed(tfutures):
-                        service_results[tfutures[tfut]] = tfut.result()
+                    for fut in as_completed(futures):
+                        service_results[futures[fut]] = fut.result()
 
-                google = service_results.get("google", TestResult(False))
-                yt = service_results.get("youtube", TestResult(False))
-                ig = service_results.get("instagram", TestResult(False))
-                tg_org = service_results.get("telegram", TestResult(False))
-                wa_www = service_results.get("whatsapp", TestResult(False))
-                # Extra domains are intentionally not required anymore.
-                tg_web = TestResult(False)
-                tg_tme = TestResult(False)
-                wa_web = TestResult(False)
-                wa_static = TestResult(False)
+                google = service_results.get("google", TestResult())
+                yt = service_results.get("youtube", TestResult())
+                ig = service_results.get("instagram", TestResult())
+                tg = service_results.get("telegram", TestResult())
+                wa = service_results.get("whatsapp", TestResult())
 
-            tg_ok = tg_org.ok
-            wa_ok = wa_www.ok
-            ok = result_ok_for_mode(
-                mode,
-                ip_ok=ip.ok,
-                google_ok=google.ok,
-                youtube_ok=yt.ok,
-                instagram_ok=ig.ok,
-                telegram_ok=tg_ok,
-                whatsapp_ok=wa_ok,
-            )
-            err = "; ".join(
-                x
-                for x in [
-                    cfg.error, ip.error, google.error, yt.error, ig.error,
-                    tg_org.error, tg_web.error, tg_tme.error,
-                    wa_www.error, wa_web.error, wa_static.error,
-                ]
-                if x
-            )[:500]
+            if mode == "light":
+                ok = ip.ok and google.ok and yt.ok
+            else:
+                ok = ip.ok and google.ok and yt.ok and ig.ok and tg.ok and wa.ok
+
+            errors = [cfg.error, ip.error, google.error, yt.error, ig.error, tg.error, wa.error]
+            err = "; ".join(x for x in errors if x)[:500]
             return LinkResult(
                 index=index,
                 name=name,
@@ -729,26 +669,14 @@ def check_one(
                 google_ok=google.ok,
                 youtube_ok=yt.ok,
                 instagram_ok=ig.ok,
-                telegram_ok=tg_ok,
-                whatsapp_ok=wa_ok,
-                telegram_org_ok=tg_org.ok,
-                telegram_web_ok=tg_web.ok,
-                telegram_tme_ok=tg_tme.ok,
-                whatsapp_www_ok=wa_www.ok,
-                whatsapp_web_ok=wa_web.ok,
-                whatsapp_static_ok=wa_static.ok,
+                telegram_ok=tg.ok,
+                whatsapp_ok=wa.ok,
                 ip_http=ip.http_code,
                 google_http=google.http_code,
                 youtube_http=yt.http_code,
                 instagram_http=ig.http_code,
-                telegram_http=tg_org.http_code,
-                whatsapp_http=wa_www.http_code,
-                telegram_org_http=tg_org.http_code,
-                telegram_web_http=tg_web.http_code,
-                telegram_tme_http=tg_tme.http_code,
-                whatsapp_www_http=wa_www.http_code,
-                whatsapp_web_http=wa_web.http_code,
-                whatsapp_static_http=wa_static.http_code,
+                telegram_http=tg.http_code,
+                whatsapp_http=wa.http_code,
                 config_time=cfg.time_total,
                 latency_score=time_to_float(cfg.time_total),
                 ip_body=ip.body_preview,
@@ -757,10 +685,7 @@ def check_one(
             )
 
     except Exception as e:
-        return make_empty_result(
-            index=index, name=name, link=link,
-            error=str(e)[:500], elapsed=time.time() - started,
-        )
+        return LinkResult(index=index, name=name, link=link, error=str(e)[:500], elapsed=time.time() - started)
     finally:
         if proc and proc.poll() is None:
             proc.terminate()
@@ -781,8 +706,6 @@ def mask_link(link: str) -> str:
         return link[:80]
 
 
-# Parameters that are understood by common Android clients such as v2rayNG/Happ.
-# Unknown/service parameters are stripped when writing working links.
 CLIENT_QUERY_ORDER = [
     ("encryption", ("encryption",), "none", True),
     ("security", ("security",), "none", True),
@@ -795,64 +718,52 @@ CLIENT_QUERY_ORDER = [
     ("spx", ("spx", "spiderX"), None, False),
     ("alpn", ("alpn",), None, False),
     ("allowInsecure", ("allowInsecure",), None, False),
-    ("path", ("path",), None, False),
     ("host", ("host",), None, False),
+    ("path", ("path",), None, False),
+    ("headerType", ("headerType",), None, False),
     ("serviceName", ("serviceName",), None, False),
     ("authority", ("authority",), None, False),
     ("mode", ("mode",), None, False),
-    ("headerType", ("headerType",), None, False),
-    ("quicSecurity", ("quicSecurity",), None, False),
-    ("key", ("key",), None, False),
+    ("mldsa65Verify", ("mldsa65Verify",), None, False),
 ]
 
 
+def first_q(q: Dict[str, List[str]], keys: Tuple[str, ...], default: Optional[str] = None) -> Optional[str]:
+    for key in keys:
+        if key in q and q[key]:
+            return urllib.parse.unquote(str(q[key][0]))
+    return default
+
+
 def clean_vless_link(link: str) -> str:
-    """Return a clean vless:// link suitable for importing into v2rayNG/Happ.
-
-    Keeps only connection-critical parameters and normalizes common aliases:
-    serverName -> sni, fingerprint -> fp, publicKey -> pbk, shortId -> sid,
-    spiderX -> spx. Everything else is stripped.
-    """
     try:
-        parsed = urllib.parse.urlsplit(link.strip())
-        if parsed.scheme.lower() != "vless":
+        p = urllib.parse.urlsplit(link.strip())
+        if p.scheme.lower() != "vless":
             return link.strip()
-
-        uuid = urllib.parse.unquote(parsed.username or "")
-        host = parsed.hostname or ""
-        port = parsed.port
-        if not uuid or not host or not port:
-            return link.strip()
-
-        # IPv6 addresses must be wrapped in brackets in URLs.
-        host_part = f"[{host}]" if ":" in host and not host.startswith("[") else host
-        q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-
-        clean_params: List[Tuple[str, str]] = []
-        for out_key, aliases, default, always in CLIENT_QUERY_ORDER:
-            value = None
-            found = False
-            for alias in aliases:
-                if alias in q:
-                    value = qget(q, alias, "")
-                    found = True
-                    break
-            if not found and always:
-                value = default
-                found = True
-            if found and value is not None:
-                clean_params.append((out_key, value))
-
-        query = urllib.parse.urlencode(clean_params, doseq=False, safe=",-")
-        name = urllib.parse.unquote(parsed.fragment or "") or host
-        fragment = urllib.parse.quote(name, safe="")
-        return f"vless://{urllib.parse.quote(uuid, safe='-')}@{host_part}:{port}?{query}#{fragment}"
+        q = urllib.parse.parse_qs(p.query, keep_blank_values=True)
+        params: List[Tuple[str, str]] = []
+        for out_key, in_keys, default, always in CLIENT_QUERY_ORDER:
+            value = first_q(q, in_keys, default)
+            if value is None:
+                continue
+            if value == "" and not always:
+                continue
+            params.append((out_key, value))
+        query = urllib.parse.urlencode(params, doseq=False)
+        user = p.username or ""
+        host = p.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = f"{user}@{host}"
+        if p.port:
+            netloc += f":{p.port}"
+        fragment = urllib.parse.quote(urllib.parse.unquote(p.fragment or ""), safe="")
+        return urllib.parse.urlunsplit(("vless", netloc, "", query, fragment))
     except Exception:
         return link.strip()
 
 
 def result_sort_key(r: LinkResult) -> Tuple[int, float, int]:
-    """Sort working links first, then by VLESS config latency, then original order."""
     return (0 if r.ok else 1, r.latency_score, r.index)
 
 
@@ -863,23 +774,14 @@ def write_csv(path: str, results: Iterable[LinkResult], clean_links: bool = True
         w.writerow([
             "index", "name", "all_ok",
             "vless_ip_ok", "google_ok", "youtube_ok", "instagram_ok", "telegram_ok", "whatsapp_ok",
-            "telegram_org_ok", "telegram_web_ok", "telegram_tme_ok",
-            "whatsapp_www_ok", "whatsapp_web_ok", "whatsapp_static_ok",
             "ip_http", "google_http", "youtube_http", "instagram_http", "telegram_http", "whatsapp_http",
-            "telegram_org_http", "telegram_web_http", "telegram_tme_http",
-            "whatsapp_www_http", "whatsapp_web_http", "whatsapp_static_http",
-            "config_latency_ms",
-            "ip_body", "elapsed_sec", "error", "link",
+            "config_latency_ms", "ip_body", "elapsed_sec", "error", "link",
         ])
         for r in rows:
             w.writerow([
                 r.index, r.name, int(r.ok),
                 int(r.ip_ok), int(r.google_ok), int(r.youtube_ok), int(r.instagram_ok), int(r.telegram_ok), int(r.whatsapp_ok),
-                int(r.telegram_org_ok), int(r.telegram_web_ok), int(r.telegram_tme_ok),
-                int(r.whatsapp_www_ok), int(r.whatsapp_web_ok), int(r.whatsapp_static_ok),
                 r.ip_http, r.google_http, r.youtube_http, r.instagram_http, r.telegram_http, r.whatsapp_http,
-                r.telegram_org_http, r.telegram_web_http, r.telegram_tme_http,
-                r.whatsapp_www_http, r.whatsapp_web_http, r.whatsapp_static_http,
                 time_to_ms(r.config_time) if r.latency_score < 9999 else "",
                 r.ip_body, f"{r.elapsed:.2f}", r.error,
                 clean_vless_link(r.link) if clean_links else r.link,
@@ -894,16 +796,7 @@ def write_links(path: str, results: Iterable[LinkResult], clean_links: bool = Tr
             f.write(out_link + "\n")
 
 
-
-def safe_filename_part(value: str) -> str:
-    """Return a safe short filename part for source-specific output files."""
-    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
-    value = value.strip("._-")
-    return value or "custom"
-
-
 def choose_input_source() -> Tuple[str, Optional[str], Optional[str]]:
-    """Ask the user to choose a built-in source when --input is not provided."""
     print("Choose VLESS source:")
     for key in sorted(PRESET_SOURCES):
         item = PRESET_SOURCES[key]
@@ -919,18 +812,14 @@ def choose_input_source() -> Tuple[str, Optional[str], Optional[str]]:
         if choice == "3":
             custom = input("Enter URL or local file path: ").strip()
             if custom:
-                # For custom URLs, fallback/cache file is inferred from URL basename.
                 return custom, None, None
         print("Invalid choice. Enter 1, 2 or 3.")
 
 
-
-def choose_check_mode() -> str:
-    """Ask the user to choose strict or soft filtering mode."""
+def choose_mode() -> str:
     print("Choose check mode:")
     print("  1) normal - strict: IP + Google + YouTube + Instagram + Telegram + WhatsApp")
     print("  2) light  - soft: IP + Google + YouTube; other services are shown but not required")
-
     while True:
         choice = input("Select mode [1-2]: ").strip().lower()
         if choice in {"1", "normal", "n"}:
@@ -943,22 +832,24 @@ def choose_check_mode() -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Check VLESS links from txt/URL. Normal mode requires IP, Google, YouTube, Instagram, Telegram and WhatsApp; light mode requires IP, Google and YouTube. cfg_ms uses gstatic generate_204")
+    ap = argparse.ArgumentParser(
+        description="Check VLESS links for IP, Google, YouTube, Instagram, Telegram and WhatsApp access. cfg_ms uses gstatic generate_204."
+    )
     ap.add_argument("--input", "-i", help="local .txt file or URL with VLESS links/subscription; if omitted, an interactive CIDR/SNI menu is shown")
-    ap.add_argument("--output", "-o", default=None, help="CSV result path; default: source-specific file for menu choices, otherwise vless_check_results.csv")
-    ap.add_argument("--working-output", default=None, help="TXT file for working VLESS links only; default: source-specific file for menu choices, otherwise working_vless.txt")
+    ap.add_argument("--mode", choices=["normal", "light"], default=None, help="normal = strict; light = IP + Google + YouTube required only")
+    ap.add_argument("--output", "-o", default=None, help="CSV result path; default: source/mode-specific file")
+    ap.add_argument("--working-output", default=None, help="TXT file for working VLESS links only; default: source/mode-specific file")
     ap.add_argument("--save-failed", action="store_true", help="include failed links in CSV too; default CSV contains only working links")
-    ap.add_argument("--workers", "-w", type=int, default=12, help="parallel xray processes; default = 12; reduce to 4-8 on a weak server")
+    ap.add_argument("--workers", "-w", type=int, default=12, help="parallel xray processes; default = 12; reduce to 4-8 on a weak server/Mac")
     ap.add_argument("--service-workers", type=int, default=6, help="parallel site checks inside each working VLESS link; default = 6")
     ap.add_argument("--timeout", "-t", type=int, default=8, help="per-request timeout seconds; default = 8; increase to 12 for fewer false FAIL results")
-    ap.add_argument("--limit", type=int, default=0, help="check only N links; default = 0/all; use 30 for first 30")
-    ap.add_argument("--offset", type=int, default=0, help="skip first N links before applying --limit; useful for checking batches: 0, 30, 60...")
-    ap.add_argument("--all-tests-even-if-ip-fails", action="store_true", help="still test Google/YouTube/Instagram/Telegram/WhatsApp if ipify check fails")
-    ap.add_argument("--no-head", action="store_true", help="use GET instead of faster HEAD for Google/YouTube/Instagram/Telegram/WhatsApp checks")
-    ap.add_argument("--mode", choices=["normal", "light"], default=None, help="filter mode: normal=strict all services, light=IP+Google+YouTube only; if omitted in a terminal, a menu is shown")
+    ap.add_argument("--limit", type=int, default=0, help="check only N links; default = 0 = all")
+    ap.add_argument("--offset", type=int, default=0, help="skip first N links before applying --limit; useful for batches")
+    ap.add_argument("--all-tests-even-if-ip-fails", action="store_true", help="still test services if ipify check fails")
+    ap.add_argument("--no-head", action="store_true", help="use GET instead of faster HEAD for service checks")
     ap.add_argument("--show-links", action="store_true", help="print full VLESS links in console; unsafe for public logs")
     ap.add_argument("--raw-output", action="store_true", help="save original links instead of cleaned v2rayNG/Happ-compatible links")
-    ap.add_argument("--local-dir", default=str(DEFAULT_LOCAL_SOURCE_DIR), help="folder for GitHub fallback/cache files; default: /root/vless_checker")
+    ap.add_argument("--local-dir", default=str(DEFAULT_LOCAL_SOURCE_DIR), help=f"folder for GitHub fallback/cache files; default: {DEFAULT_LOCAL_SOURCE_DIR}")
     args = ap.parse_args()
 
     source_label: Optional[str] = None
@@ -967,17 +858,14 @@ def main() -> int:
         args.input, source_label, local_fallback = choose_input_source()
 
     if args.mode is None:
-        args.mode = choose_check_mode() if sys.stdin.isatty() else "normal"
+        args.mode = choose_mode()
+    else:
+        print(f"Selected mode: {args.mode}")
 
-    mode_suffix = safe_filename_part(args.mode)
-
-    # Auto-save menu choices into different files. Explicit --output / --working-output
-    # still overrides these defaults. The mode suffix prevents strict/light runs
-    # from overwriting each other.
     if args.output is None:
-        args.output = f"vless_check_results_{safe_filename_part(source_label)}_{mode_suffix}.csv" if source_label else f"vless_check_results_{mode_suffix}.csv"
+        args.output = f"vless_check_results_{safe_filename_part(source_label)}_{args.mode}.csv" if source_label else f"vless_check_results_{args.mode}.csv"
     if args.working_output is None:
-        args.working_output = f"working_vless_{safe_filename_part(source_label)}_{mode_suffix}.txt" if source_label else f"working_vless_{mode_suffix}.txt"
+        args.working_output = f"working_vless_{safe_filename_part(source_label)}_{args.mode}.txt" if source_label else f"working_vless_{args.mode}.txt"
 
     xray_bin = shutil.which("xray")
     curl_bin = shutil.which("curl")
@@ -988,12 +876,17 @@ def main() -> int:
         print("ERROR: curl not found in PATH.", file=sys.stderr)
         return 2
 
-    text = read_input(args.input, local_fallback=local_fallback, local_source_dir=Path(args.local_dir))
+    try:
+        text = read_input(args.input, local_fallback=local_fallback, local_source_dir=Path(args.local_dir).expanduser())
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
     links = extract_vless_links(text)
     if args.offset and args.offset > 0:
-        links = links[args.offset :]
+        links = links[args.offset:]
     if args.limit and args.limit > 0:
-        links = links[: args.limit]
+        links = links[:args.limit]
 
     if not links:
         print("ERROR: no vless:// links found. If this is a subscription, make sure it is plain text or base64.", file=sys.stderr)
@@ -1002,13 +895,11 @@ def main() -> int:
     offset_note = f", offset={args.offset}" if args.offset else ""
     log(
         f"Found {len(links)} VLESS links{offset_note}. "
-        f"Checking with workers={args.workers}, service_workers={args.service_workers}, "
-        f"timeout={args.timeout}s, site_method={'GET' if args.no_head else 'HEAD'}, "
-        f"mode={args.mode} ({CHECK_MODES[args.mode]['description']}), "
-        f"cfg_latency=gstatic_generate_204"
+        f"mode={args.mode}, workers={args.workers}, service_workers={args.service_workers}, "
+        f"timeout={args.timeout}s, site_method={'GET' if args.no_head else 'HEAD'}"
     )
-    results: List[LinkResult] = []
 
+    results: List[LinkResult] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         futures = {
             ex.submit(
@@ -1029,8 +920,8 @@ def main() -> int:
             r = fut.result()
             results.append(r)
             shown = r.link if args.show_links else mask_link(r.link)
-            status_plain = "OK" if r.ok else "FAIL"
-            status = color_text(status_plain, COLOR_GREEN if r.ok else COLOR_RED)
+            status_raw = "OK" if r.ok else "FAIL"
+            status = color_text(status_raw, COLOR_GREEN if r.ok else COLOR_RED)
             config_ms = time_to_ms(r.config_time) if r.latency_score < 9999 else "-"
             log(
                 f"[{r.index}/{len(links)}] {status} "
@@ -1062,6 +953,7 @@ def main() -> int:
     print("\nSummary")
     print(f"  total checked:   {total}")
     print(f"  working saved:   {all_ok}")
+    print(f"  mode:            {args.mode}")
     print(f"  vless/ip ok:     {ip_ok}")
     print(f"  google ok:       {google_ok}")
     print(f"  youtube ok:      {yt_ok}")
@@ -1071,7 +963,8 @@ def main() -> int:
     if working_results:
         fastest = sorted(working_results, key=result_sort_key)[0]
         print(f"  fastest config:  {time_to_ms(fastest.config_time)} ms  ({fastest.name})")
-    print(f"  sort:            fastest configs first by gstatic generate_204 latency")
+    print("  sort:            fastest configs first by gstatic generate_204 latency")
+    print(f"  local dir:       {Path(args.local_dir).expanduser()}")
     print(f"  txt working:     {args.working_output}" + (" (clean client links)" if clean_links else " (raw links)"))
     print(f"  csv:             {args.output}" + (" (all results)" if args.save_failed else " (working only)"))
 
