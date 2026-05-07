@@ -2,11 +2,14 @@
 
 Скрипт для массовой проверки VLESS-ссылок из CIDR/SNI списков.
 
-Подходит для проверки конфигов на VPS, macOS и Windows. Скрипт запускает `xray` как временный VLESS-клиент, поднимает локальный SOCKS-прокси и проверяет доступность сервисов через каждый конфиг.
+Скрипт запускает `xray` как временный VLESS-клиент, поднимает локальный SOCKS-прокси и проверяет доступность сервисов через каждый конфиг.
 
 ## Возможности
 
-- выбор источника: `CIDR` или `SNI`;
+- выбор источника:
+  - `CIDR` — `WHITE-CIDR-RU-all.txt`;
+  - `SNI` — `WHITE-SNI-RU-all.txt`;
+  - `CIDR_checked` — `WHITE-CIDR-RU-checked.txt`;
 - автоматическая загрузка списков с GitHub;
 - fallback на локальные `.txt` файлы, если GitHub недоступен;
 - режимы проверки:
@@ -68,8 +71,9 @@ cd vless-checker
 
 ```bash
 mkdir -p /root/vless_checker
-cp WHITE-CIDR-RU-all.txt /root/vless_checker/
-cp WHITE-SNI-RU-all.txt /root/vless_checker/
+cp WHITE-CIDR-RU-all.txt /root/vless_checker/ 2>/dev/null || true
+cp WHITE-SNI-RU-all.txt /root/vless_checker/ 2>/dev/null || true
+cp WHITE-CIDR-RU-checked.txt /root/vless_checker/ 2>/dev/null || true
 ```
 
 Запуск:
@@ -98,8 +102,9 @@ cd vless-checker
 
 ```bash
 mkdir -p ~/vless_checker
-cp WHITE-CIDR-RU-all.txt ~/vless_checker/
-cp WHITE-SNI-RU-all.txt ~/vless_checker/
+cp WHITE-CIDR-RU-all.txt ~/vless_checker/ 2>/dev/null || true
+cp WHITE-SNI-RU-all.txt ~/vless_checker/ 2>/dev/null || true
+cp WHITE-CIDR-RU-checked.txt ~/vless_checker/ 2>/dev/null || true
 ```
 
 Запуск:
@@ -149,7 +154,8 @@ python .\check_vless_bulk.py --local-dir .
 ```text
 1) CIDR
 2) SNI
-3) Enter custom URL or local file path
+3) CIDR_checked
+4) Enter custom URL or local file path
 ```
 
 Затем предложит выбрать режим:
@@ -157,6 +163,32 @@ python .\check_vless_bulk.py --local-dir .
 ```text
 1) normal - strict
 2) light  - soft
+```
+
+## Источники без меню
+
+CIDR:
+
+```bash
+python3 check_vless_bulk.py --mode light --input "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt"
+```
+
+SNI:
+
+```bash
+python3 check_vless_bulk.py --mode light --input "https://github.com/igareck/vpn-configs-for-russia/blob/main/WHITE-SNI-RU-all.txt"
+```
+
+CIDR checked:
+
+```bash
+python3 check_vless_bulk.py --mode light --input "https://github.com/igareck/vpn-configs-for-russia/blob/main/WHITE-CIDR-RU-checked.txt"
+```
+
+На Windows добавляй `--local-dir .`:
+
+```powershell
+python .\check_vless_bulk.py --mode light --local-dir . --input "https://github.com/igareck/vpn-configs-for-russia/blob/main/WHITE-CIDR-RU-checked.txt"
 ```
 
 ## Режимы проверки
@@ -245,7 +277,7 @@ python3 check_vless_bulk.py --offset 60 --limit 30
 python3 check_vless_bulk.py --workers 8 --service-workers 5 --timeout 8
 ```
 
-Если много ложных `FAIL`, увеличьте таймаут:
+Если много ложных `FAIL`, увеличь таймаут:
 
 ```bash
 python3 check_vless_bulk.py --timeout 12
@@ -317,6 +349,20 @@ working_vless_SNI_light.txt
 vless_check_results_SNI_light.csv
 ```
 
+Для CIDR checked normal:
+
+```text
+working_vless_CIDR_checked_normal.txt
+vless_check_results_CIDR_checked_normal.csv
+```
+
+Для CIDR checked light:
+
+```text
+working_vless_CIDR_checked_light.txt
+vless_check_results_CIDR_checked_light.csv
+```
+
 Файлы `working_vless_*.txt` содержат чистые VLESS-ссылки, пригодные для импорта в v2rayNG / Happ.
 
 CSV-файлы содержат подробные результаты проверки.
@@ -330,6 +376,7 @@ CSV-файлы содержат подробные результаты пров
 ```text
 /root/vless_checker/WHITE-CIDR-RU-all.txt
 /root/vless_checker/WHITE-SNI-RU-all.txt
+/root/vless_checker/WHITE-CIDR-RU-checked.txt
 ```
 
 На macOS по умолчанию:
@@ -337,6 +384,7 @@ CSV-файлы содержат подробные результаты пров
 ```text
 ~/vless_checker/WHITE-CIDR-RU-all.txt
 ~/vless_checker/WHITE-SNI-RU-all.txt
+~/vless_checker/WHITE-CIDR-RU-checked.txt
 ```
 
 На Windows лучше запускать так, чтобы локальные `.txt` лежали рядом со скриптом:
@@ -352,6 +400,12 @@ python3 check_vless_bulk.py --local-dir /path/to/folder
 ```
 
 ## Примеры
+
+### Быстрая проверка CIDR checked в лёгком режиме
+
+```bash
+python3 check_vless_bulk.py --mode light --input "https://github.com/igareck/vpn-configs-for-russia/blob/main/WHITE-CIDR-RU-checked.txt"
+```
 
 ### Быстрая проверка CIDR в лёгком режиме
 
