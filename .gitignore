@@ -1,0 +1,6 @@
+__pycache__/ 
+*.pyc 
+*.log 
+working_vless_*.txt 
+vless_check_results_*.csv 
+results.csv 
