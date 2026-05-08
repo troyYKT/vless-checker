@@ -1,4 +1,4 @@
-# profile-title: 🏳️ БЕЛЫЕ СПИСКИ 🏳️ WHITE LISTS | CIDR | Полная • Full
+# profile-title1: 🏳️ БЕЛЫЕ СПИСКИ 🏳️ WHITE LISTS | CIDR | Полная • Full
 # profile-update-interval: 1
 # Date/Time: 2026-05-08 / 16:18 (Moscow)
 # Количество: 249
