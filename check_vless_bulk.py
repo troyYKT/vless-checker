@@ -5,6 +5,7 @@ Bulk VLESS checker.
 What this version is optimized for:
 - fewer false OK results under blocking/unstable networks
 - real website checks by default, not only tiny generate_204/favicon probes
+- social checks treat HTTP 400/403/429 as reachable when curl itself connected
 - confirmation runs: a config must pass more than once before being saved
 - lower default concurrency to avoid overloading your Mac/network/proxy
 - GitHub download fallback that survives macOS Python CA problems
@@ -634,9 +635,15 @@ def http_ok(code: str, kind: str) -> bool:
         c = int(code)
     except Exception:
         return False
+
+    # cfg/ip/google/youtube are strict because they are the core signal.
+    # For social-network homepage checks, some sites often return HTTP 400/403/429
+    # to curl/proxy requests while the connection and routing are actually alive.
+    # Treat those as "reachable" rather than dead. This fixes the common case
+    # where WhatsApp returns 400 and would otherwise make every good config fail.
     if kind in {"ip", "cfg", "real"}:
         return 200 <= c < 400
-    if kind == "probe":
+    if kind in {"probe", "reachable"}:
         return 200 <= c < 500
     return 200 <= c < 400
 
@@ -743,9 +750,12 @@ def service_specs(profile: str) -> List[Tuple[str, str, str, int]]:
     return [
         ("google", DEFAULT_TESTS["google_real"], "real", 1500),
         ("youtube", DEFAULT_TESTS["youtube_real"], "real", 20000),
-        ("instagram", DEFAULT_TESTS["instagram_real"], "real", 1500),
+        # Instagram can rate-limit automated checks with 429 even when the route works.
+        ("instagram", DEFAULT_TESTS["instagram_real"], "reachable", 0),
         ("telegram", DEFAULT_TESTS["telegram_real"], "real", 3000),
-        ("whatsapp", DEFAULT_TESTS["whatsapp_real"], "real", 3000),
+        # WhatsApp frequently returns HTTP 400 to curl through SOCKS, which still means
+        # DNS/TLS/routing reached the service. Do not reject a config just for that.
+        ("whatsapp", DEFAULT_TESTS["whatsapp_real"], "reachable", 0),
     ]
 
 
